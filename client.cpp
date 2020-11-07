@@ -64,16 +64,16 @@ typedef struct {
 } RTFargs;
 
 typedef struct {
-    size_t* n_wkr_threads;
-    PCBuffer* PCB;
-    RequestChannel* rc;
-    std::unordered_map<std::string, PatientHistogram>* PatientData;
-} WTFargs;
-
-typedef struct {
     std::unordered_map<std::string, PatientHistogram>* PatientData;
     std::string patient_name;
 } STFargs;
+
+typedef struct {
+    PCBuffer* PCB;
+    std::unordered_map<int, RequestChannel*>* rq_chans;
+    fd_set* readset;
+    int maxfd;
+} EHargs;
 
 Semaphore n_req_thread_count_mutex(1);
 Semaphore n_wkr_thread_count_mutex(1);
@@ -134,51 +134,39 @@ void* request_thread_func(void* rtfargs) {
     return nullptr;
 }
 
-void* worker_thread_func(void* wtfargs) {
-    WTFargs* args = (WTFargs*) wtfargs;
-    size_t* n_wkr_threads = args->n_wkr_threads;
+void* event_handler_func(void* ehargs) {
+    EHargs* args = (EHargs *) ehargs;
+    fd_set* readset = args->readset;
+    int maxfd = args->maxfd;
+    bool done = false;
+    std::unordered_map<int, RequestChannel*>* rq_chans = args->rq_chans;
     for(;;) {
-        std::string req = args->PCB->Retrieve();
-        
-        // The number of threads active is a shared variable, so we need to synchronize the access to the variable.
-        if (req.compare("done") == 0) {
-            std::cout << "Worker thread read 'done' from PCBuffer" << std::endl;
-            args->rc->send_request("quit");
-            args->PCB->Deposit("done");
-            n_wkr_thread_count_mutex.P();
-            if (*n_wkr_threads != 1) {
-                *n_wkr_threads = *n_wkr_threads - 1;
-            } else {
-                /* We have to iterate this way because it is an unordered (hash) map. 
-                   Only the last worker thread can send the 'done' message to the statistics
-                   threads. */
-                for (auto i : *args->PatientData) {
-                    i.second.PatientDataBuffer->Deposit("done");
+        fd_set active_readset = *readset;
+        if (select(maxfd + 1, &active_readset, NULL, NULL, NULL) > 0 && !done) {
+            for (int fd = 0; fd <= maxfd; fd++) {
+                if(!FD_ISSET(fd, &active_readset))
+                    continue;
+                else {
+                    RequestChannel* rq_chan = rq_chans->find(fd)->second;
+                    std::string reply = rq_chan->cread();
+
+                    std::string req = args->PCB->Retrieve();
+                    if (req.compare("done") == 0) {
+                        done = true;
+                        break;
+                    }
+                    rq_chan->cwrite(req);
                 }
-                *n_wkr_threads = *n_wkr_threads - 1;
             }
-            std::cout << "Worker thread finished." << std::endl;
-            n_wkr_thread_count_mutex.V();
+        } else {
             break;
         }
-
-        std::cout << "New request: " << req << std::endl;
-        std::string reply = args->rc->send_request(req);
-        std::cout << "Out from PCBuffer: " << req << std::endl;
-        std::cout << "Reply to request '" << req << "': " << reply << std::endl;
-
-        std::string name = req.substr(5, req.length() - 1);
-        PCBuffer* patient_buff = (*args->PatientData)[name].PatientDataBuffer;
-        patient_buff->Deposit(reply);
     }
-
+    for (auto i : *rq_chans) {
+        i.second->send_request("quit");
+    }
+    usleep(1000000);
     return nullptr;
-}
-
-void* event_handler_func(void* args) {
-    for(;;) {
-        // TODO: Implement the selection process.
-    }
 }
 
 
@@ -235,16 +223,6 @@ void* stats_thread_func(void* args) {
 /* These functions prepare the arguments and then creates the thread; The thread is linked to their arguments with the
    the thread index that it takes in, along with the other required objects needed to create the thread */
 
-void create_worker(int _thread_num, RequestChannel* _rc, PCBuffer* _PCB, size_t* n_wkr_thread_count, 
-                    std::unordered_map<std::string, PatientHistogram>* patient_data,
-                    pthread_t* wk_threads, WTFargs* args) {
-    args[_thread_num].PCB = _PCB;
-    args[_thread_num].rc = _rc;
-    args[_thread_num].PatientData = patient_data;
-    args[_thread_num].n_wkr_threads = n_wkr_thread_count;
-    pthread_create(&wk_threads[_thread_num], NULL, worker_thread_func, (void*) &args[_thread_num]);
-}
-
 void create_requester(int _thread_num, int _num_requests, std::string _patient_name, PCBuffer* _PCB, 
                         pthread_t* rq_threads, size_t* _n_req_threads, RTFargs* args) {
     args[_thread_num].n_req = _num_requests;
@@ -259,6 +237,15 @@ void create_stats(int _thread_num, std::string _patient_name, std::unordered_map
     args[_thread_num].PatientData = patient_data;
     args[_thread_num].patient_name = _patient_name;
     pthread_create(&st_threads[_thread_num], NULL, stats_thread_func, (void*) &args[_thread_num]);
+}
+
+void create_event_handler(std::unordered_map<int, RequestChannel*>* _rq_chans, fd_set* _readset, int _maxfd, PCBuffer* _PCB, 
+                            pthread_t* eh_thread, EHargs* args) {
+    args->rq_chans = _rq_chans;
+    args->readset = _readset;
+    args->maxfd = _maxfd;
+    args->PCB = _PCB;
+    pthread_create(eh_thread, NULL, event_handler_func, (void *) args);
 }
 
 /*--------------------------------------------------------------------------*/
@@ -318,20 +305,16 @@ int main(int argc, char * argv[]) {
         /* We create an array of threads to keep track of their thread ids, the statistics threads in particular. */
         pthread_t* rq_threads = new pthread_t[NUM_PATIENTS];
         pthread_t* event_thrd = new pthread_t();
-        //pthread_t* st_threads = new pthread_t[NUM_PATIENTS];
-        //pthread_t* wk_threads = new pthread_t[num_threads];
         
         /* We allocate an array of arguments for the threads here so that we can delete them later when the program is finishing up. */
-        //WTFargs* wtfargs = new WTFargs[num_threads];
         RTFargs* rtfargs = new RTFargs[NUM_PATIENTS];
+        EHargs* ehargs = new EHargs();
         //STFargs* stfargs = new STFargs[NUM_PATIENTS];
 
-        //std::vector<RequestChannel*> rq_chans; // Test on linux
         std::unordered_map<int, RequestChannel*> rq_chans;
 
         /* We will pass the memory addresses of these size_t's into the arguments; they will be shared across their respective threads */
         size_t n_req_threads = NUM_PATIENTS;
-        //size_t n_wkr_threads = num_threads;
 
         std::cout << "Creating request threads..." << std::endl;
         for (size_t i = 0; i < NUM_PATIENTS; i++) {
@@ -352,12 +335,16 @@ int main(int argc, char * argv[]) {
 
         FD_ZERO(&readset);
 
+        int maxfd = 0;
+
         for (size_t i = 0; i < num_chan; i++) {
             std::string reply = chan.send_request("newthread");
             std::cout << "Reply to request 'newthread' is " << reply << std::endl;
             std::cout << "Establishing new control channel... " << std::flush;
             RequestChannel* rc = new RequestChannel(reply, RequestChannel::Side::CLIENT);
             int rfd = rc->read_fd();
+            if (rfd >= maxfd)
+                maxfd = rfd;
             FD_SET(rfd, &readset);
             rq_chans[rfd] = rc;
             std::cout << "done." << std::endl;
@@ -365,18 +352,9 @@ int main(int argc, char * argv[]) {
             rq_chans[rfd]->cwrite(PCB.Retrieve());
         }
 
-        pthread_create(event_thrd, NULL, event_handler_func, NULL);
+        //pthread_create(event_thrd, NULL, event_handler_func, NULL);
+        create_event_handler(&rq_chans, &readset, maxfd, &PCB, event_thrd, ehargs);
         pthread_join(*event_thrd, NULL);
-
-        /*for (size_t i = 0; i < num_threads; i++) {
-            std::string reply = chan.send_request("newthread");
-            std::cout << "Reply to request 'newthread' is " << reply << std::endl;
-            std::cout << "Establishing new control channel... " << std::flush;
-            // These channels need to be allocated on the heap for the same reason as the stats buffers.
-            RequestChannel* new_chan = new RequestChannel(reply, RequestChannel::Side::CLIENT);
-            std::cout << "done." << std::endl;
-            create_worker(i, new_chan, &PCB, &n_wkr_threads, &patient_data, wk_threads, wtfargs);
-        }*/
 
         /* We need to wait for the termination of the statistics thread AND the last worker thread (see worker_thread_func), otherwise the program
            will terminate prematurely */
@@ -388,23 +366,21 @@ int main(int argc, char * argv[]) {
         std::cout << "Reply from control channel read: " << fin_reply << std::endl;
         std::cout << "done." << std::endl;
 
-        //std::cout << "Clearing the heap..." << std::endl;
+        std::cout << "Clearing the heap..." << std::endl;
 
         /* We call detach on the other threads so that memory can be freed, and there will be no memory leaks, additionally we delete the request
            channels here so that we don't have to loop twice. */
-        /*for (size_t i = 0; i < NUM_PATIENTS; i++)
+        for (size_t i = 0; i < NUM_PATIENTS; i++)
             pthread_detach(rq_threads[i]);
-        for (size_t i = 0; i < num_threads; i++) {
-            pthread_detach(wk_threads[i]);    
-            delete wtfargs[i].rc; // The reason they are deleted here is so that the server threads have a chance to read the quit message, or else it 
-                                  // can leave behind some fifo_* files.
-        }*/
 
+        for (auto i : rq_chans)
+            delete i.second;
+            
         delete[] rq_threads;
-        /*delete[] wk_threads;
-        delete[] st_threads;
-        delete[] wtfargs;
+        delete event_thrd;
+        /*delete[] st_threads;
         delete[] stfargs;*/
+        delete ehargs;
         delete[] rtfargs;
         std::cout << "Client stopped successfully." << std::endl;
     }
