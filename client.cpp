@@ -27,6 +27,7 @@
 #include <vector>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/select.h>
 
 #include <errno.h>
 #include <unistd.h>
@@ -316,6 +317,7 @@ int main(int argc, char * argv[]) {
 
         /* We create an array of threads to keep track of their thread ids, the statistics threads in particular. */
         pthread_t* rq_threads = new pthread_t[NUM_PATIENTS];
+        pthread_t* event_thrd = new pthread_t();
         //pthread_t* st_threads = new pthread_t[NUM_PATIENTS];
         //pthread_t* wk_threads = new pthread_t[num_threads];
         
@@ -324,7 +326,8 @@ int main(int argc, char * argv[]) {
         RTFargs* rtfargs = new RTFargs[NUM_PATIENTS];
         //STFargs* stfargs = new STFargs[NUM_PATIENTS];
 
-        RequestChannel* rq_chans = std::malloc(sizeof(RequestChannel)); // Test on linux
+        //std::vector<RequestChannel*> rq_chans; // Test on linux
+        std::unordered_map<int, RequestChannel*> rq_chans;
 
         /* We will pass the memory addresses of these size_t's into the arguments; they will be shared across their respective threads */
         size_t n_req_threads = NUM_PATIENTS;
@@ -345,6 +348,26 @@ int main(int argc, char * argv[]) {
         }
         std::cout << "done." << std::endl;
 
+        fd_set readset;
+
+        FD_ZERO(&readset);
+
+        for (size_t i = 0; i < num_chan; i++) {
+            std::string reply = chan.send_request("newthread");
+            std::cout << "Reply to request 'newthread' is " << reply << std::endl;
+            std::cout << "Establishing new control channel... " << std::flush;
+            RequestChannel* rc = new RequestChannel(reply, RequestChannel::Side::CLIENT);
+            int rfd = rc->read_fd();
+            FD_SET(rfd, &readset);
+            rq_chans[rfd] = rc;
+            std::cout << "done." << std::endl;
+            std::cout << "Writing first request to pipe..." << std::endl;
+            rq_chans[rfd]->cwrite(PCB.Retrieve());
+        }
+
+        pthread_create(event_thrd, NULL, event_handler_func, NULL);
+        pthread_join(*event_thrd, NULL);
+
         /*for (size_t i = 0; i < num_threads; i++) {
             std::string reply = chan.send_request("newthread");
             std::cout << "Reply to request 'newthread' is " << reply << std::endl;
@@ -360,10 +383,10 @@ int main(int argc, char * argv[]) {
         /*for (size_t i = 0; i < NUM_PATIENTS; i++)
             pthread_join(st_threads[i], NULL);*/
 
-        //std::cout << "Closing control request channel..." << std::endl;
-        //std::string fin_reply = chan.send_request("quit");
-        //std::cout << "Reply from control channel read: " << fin_reply << std::endl;
-        //std::cout << "done." << std::endl;
+        std::cout << "Closing control request channel..." << std::endl;
+        std::string fin_reply = chan.send_request("quit");
+        std::cout << "Reply from control channel read: " << fin_reply << std::endl;
+        std::cout << "done." << std::endl;
 
         //std::cout << "Clearing the heap..." << std::endl;
 
