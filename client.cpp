@@ -41,32 +41,11 @@
 /*--------------------------------------------------------------------------*/
 
 typedef struct {
-    /* Histogram bins
-        0 - 9
-        10 - 19
-        20 - 29
-        30 - 39
-        40 - 49
-        50 - 59
-        60 - 69
-        70 - 79
-        80 - 89
-        90 - 99 */
-    PCBuffer* PatientDataBuffer;
-    std::vector<int> histogram; 
-} PatientHistogram;
-
-typedef struct {
     size_t* n_req_threads;
     size_t n_req;
     PCBuffer* PCB;
     std::string patient_name;
 } RTFargs;
-
-typedef struct {
-    std::unordered_map<std::string, PatientHistogram>* PatientData;
-    std::string patient_name;
-} STFargs;
 
 typedef struct {
     PCBuffer* PCB;
@@ -76,8 +55,6 @@ typedef struct {
 } EHargs;
 
 Semaphore n_req_thread_count_mutex(1);
-Semaphore n_wkr_thread_count_mutex(1);
-Semaphore histogram_print_sync(1);
 
 /*--------------------------------------------------------------------------*/
 /* CONSTANTS */
@@ -122,12 +99,16 @@ void* event_handler_func(void* ehargs) {
     EHargs* args = (EHargs *) ehargs;
     fd_set* readset = args->readset;
     int maxfd = args->maxfd;
+    // We need this to break out of the nested for loop
     bool done = false;
     std::unordered_map<int, RequestChannel*>* rq_chans = args->rq_chans;
     for(;;) {
+        // We still need the original fd_set to determine if any new files are ready
+        // so we copy it into this fd_set every loop
         fd_set active_readset = *readset;
         if (select(maxfd + 1, &active_readset, NULL, NULL, NULL) > 0 && !done) {
             for (int fd = 0; fd <= maxfd; fd++) {
+                // If the file decriptor(s) is/are not "set" we wait until it is
                 if(!FD_ISSET(fd, &active_readset))
                     continue;
                 else {
@@ -135,6 +116,8 @@ void* event_handler_func(void* ehargs) {
                     std::string reply = rq_chan->cread();
 
                     std::string req = args->PCB->Retrieve();
+                    // "done" is not a valid request to the server, we have to break and teardown all of the request
+                    // channels using "quit"
                     if (req.compare("done") == 0) {
                         done = true;
                         break;
@@ -148,6 +131,7 @@ void* event_handler_func(void* ehargs) {
     }
     for (auto i : *rq_chans) {
         i.second->send_request("quit");
+        // Giving it a little bit of time to close and delete the named pipes
         usleep(1000);
     }
     return nullptr;
@@ -245,20 +229,25 @@ int main(int argc, char * argv[]) {
         }
         std::cout << "done." << std::endl;
 
+        // Creating the readset of FDs
         fd_set readset;
 
+        // Zeroing the fdset
         FD_ZERO(&readset);
 
         int maxfd = 0;
 
+        // Here we "prime the pump"
         for (size_t i = 0; i < num_chan; i++) {
             std::string reply = chan.send_request("newthread");
             std::cout << "Reply to request 'newthread' is " << reply << std::endl;
             std::cout << "Establishing new control channel... " << std::flush;
             RequestChannel* rc = new RequestChannel(reply, RequestChannel::Side::CLIENT);
+            // Getting the read file decriptor to determine the max
             int rfd = rc->read_fd();
             if (rfd >= maxfd)
                 maxfd = rfd;
+            // Adding this fd to the fdset
             FD_SET(rfd, &readset);
             rq_chans[rfd] = rc;
             std::cout << "done." << std::endl;
@@ -266,7 +255,7 @@ int main(int argc, char * argv[]) {
             rq_chans[rfd]->cwrite(PCB.Retrieve());
         }
 
-        //pthread_create(event_thrd, NULL, event_handler_func, NULL);
+        // Creating the event handler
         create_event_handler(&rq_chans, &readset, maxfd, &PCB, event_thrd, ehargs);
         pthread_join(*event_thrd, NULL);
 
@@ -278,8 +267,7 @@ int main(int argc, char * argv[]) {
 
         std::cout << "Clearing the heap..." << std::endl;
 
-        /* We call detach on the other threads so that memory can be freed, and there will be no memory leaks, additionally we delete the request
-           channels here so that we don't have to loop twice. */
+        /* We call detach on the other threads so that memory can be freed, and there will be no memory leaks */
         for (size_t i = 0; i < NUM_PATIENTS; i++)
             pthread_detach(rq_threads[i]);
 
